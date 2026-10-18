@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Expediente Escolar</title>
+<meta name="description" content="Horario, tareas, calificaciones, faltas y repasos para la universidad, con guardado en Google Drive.">
+<meta name="theme-color" content="#F6F4F8" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#141119" media="(prefers-color-scheme: dark)">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Expediente">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,800&family=IBM+Plex+Mono:wght@500;600&display=swap">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div id="app" aria-live="polite"><p class="boot">Abriendo tu expediente…</p></div>
+<div id="sheet" class="sheet-wrap" hidden>
+  <div class="scrim" data-act="close"></div>
+  <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="sheet-title"><div id="sheet-body"></div></div>
+</div>
+<div id="toast" class="toast" role="status" hidden></div>
+<script src="config.js"></script>
+<script src="drive.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
