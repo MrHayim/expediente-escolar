@@ -1,6 +1,6 @@
 // Permite abrir la app sin internet y mostrar avisos.
-const CACHE = 'expediente-v1';
-const SHELL = ['./', 'index.html', 'app.css', 'app.js', 'drive.js', 'config.js', 'manifest.webmanifest', 'icons/icon.svg', 'icons/icon-192.png', 'icons/icon-512.png'];
+const CACHE = 'expediente-v2';
+const SHELL = ['./', 'index.html', 'app.css', 'app.js', 'config.js', 'manifest.webmanifest', 'icons/icon.svg', 'icons/icon-192.png', 'icons/icon-512.png'];
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));

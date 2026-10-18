@@ -1,5 +1,5 @@
 // Expediente Escolar: horario, tareas, calificaciones, faltas, repasos y estudio.
-// Guarda primero en el navegador y sincroniza con Google Drive cuando hay sesión.
+// Guarda primero en el navegador y sincroniza con una hoja de Google Sheets (Apps Script); cada perfil entra con PIN.
 'use strict';
 
 /* =========================================================
@@ -57,151 +57,123 @@ const I = {
 const LOGO = '<svg width="34" height="34" viewBox="0 0 64 64" aria-hidden="true"><rect width="64" height="64" rx="16" fill="#4A3A8C"/><circle cx="26" cy="27" r="13" fill="#D9487A"/><circle cx="40" cy="38" r="11" fill="#B6A9EE" opacity=".9"/><circle cx="26" cy="27" r="4.5" fill="#4A3A8C"/><circle cx="40" cy="38" r="3.5" fill="#4A3A8C"/></svg>';
 
 /* =========================================================
-   Almacenamiento local
+   Almacenamiento: copia local + servidor en Google Sheets
    ========================================================= */
 const LS = {
   get(k) { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : null; } catch (e) { return null; } },
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); return true; } catch (e) { return false; } },
   del(k) { try { localStorage.removeItem(k); } catch (e) { /* nada */ } }
 };
-const DEV = Object.assign({ account: null, name: null, active: {}, notif: { on: false, claseMin: 10 }, notified: {} }, LS.get('expediente:device') || {});
+const API = String((window.EXPEDIENTE_CONFIG || {}).apiUrl || '').trim();
+const DEV = Object.assign({ active: null, sessions: {}, notif: { on: false, claseMin: 10 }, notified: {} }, LS.get('expediente:device') || {});
 const saveDev = () => LS.set('expediente:device', DEV);
-const emptyDoc = () => ({ v: 1, updatedAt: 0, profiles: [], deleted: [] });
+const DEMO = 'demo';
+const dispositivo = () => { const u = navigator.userAgent; return /iPhone/.test(u) ? 'iPhone' : /iPad/.test(u) ? 'iPad' : /Android/.test(u) ? 'Android' : /Windows/.test(u) ? 'Windows' : /Mac/.test(u) ? 'Mac' : 'Navegador'; };
 
-function mergeDocs(a, b) {
-  const deleted = new Set([...(a.deleted || []), ...(b.deleted || [])]);
-  const map = new Map();
-  for (const p of [...(a.profiles || []), ...(b.profiles || [])]) {
-    if (!p || deleted.has(p.id)) continue;
-    const cur = map.get(p.id);
-    if (!cur || (p.updatedAt || 0) > (cur.updatedAt || 0)) map.set(p.id, p);
-  }
-  return {
-    v: 1,
-    updatedAt: Math.max(a.updatedAt || 0, b.updatedAt || 0),
-    profiles: [...map.values()].sort((x, y) => (x.createdAt || 0) - (y.createdAt || 0)),
-    deleted: [...deleted].slice(-200)
-  };
+async function api(body, timeout = 25000) {
+  if (!API) throw new Error('sin-servidor');
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), timeout);
+  try {
+    const r = await fetch(API, { method: 'POST', body: JSON.stringify(body), headers: { 'Content-Type': 'text/plain;charset=utf-8' }, signal: ctl.signal, redirect: 'follow' });
+    return await r.json();
+  } finally { clearTimeout(t); }
 }
-const signature = (doc) => (doc.profiles || []).map((p) => p.id + ':' + (p.updatedAt || 0)).join('|') + '#' + (doc.deleted || []).join(',');
 
-/* =========================================================
-   Sincronización con Google Drive
-   ========================================================= */
-const Sync = {
-  status: 'local', last: 0, timer: null, pushing: false, again: false,
-  key() { return 'expediente:doc:' + (DEV.account || 'local'); },
-  smeta() { return LS.get('expediente:sync:' + DEV.account) || {}; },
-  setSmeta(m) { LS.set('expediente:sync:' + DEV.account, m); },
-  saveLocal() { LS.set(this.key(), S.doc); },
-  changed() {
-    S.doc.updatedAt = Date.now();
-    this.saveLocal();
-    if (!DEV.account) return;
-    const m = this.smeta(); m.dirty = true; this.setSmeta(m);
-    this.status = Drive.hasToken() ? 'busy' : 'pending';
-    renderSync();
-    clearTimeout(this.timer);
-    this.timer = setTimeout(() => this.push(), 1500);
+const Store = {
+  status: 'ok', last: 0, timer: null, saving: false, again: false,
+  key: (id) => 'expediente:p:' + id,
+  dirtyKey: (id) => 'expediente:dirty:' + id,
+  local(id) { const d = LS.get(this.key(id)); return d ? normalize(d) : null; },
+  isDirty(id) { return !!LS.get(this.dirtyKey(id)); },
+  async refreshList() {
+    if (!API) return;
+    try {
+      const r = await api({ action: 'estado' }, 20000);
+      if (r.ok) { S.perfiles = r.perfiles; LS.set('expediente:perfiles', r.perfiles); S.offline = false; }
+    } catch (e) { S.offline = true; }
   },
-  ok() { this.status = 'ok'; this.last = Date.now(); renderSync(); },
-  async connect() {
+  // Abre un perfil que ya tiene sesión en este dispositivo.
+  async activate(id) {
+    DEV.active = id; saveDev();
+    const meta = S.perfiles.find((p) => p.id === id) || {};
+    S.data = this.local(id) || (id === DEMO ? null : newProfile({ id, nombre: meta.nombre, color: meta.color }));
+    S.fMat = 'todas';
+    render();
+    if (id !== DEMO) await this.pull();
+  },
+  async pull() {
+    const id = S.data && S.data.id, tok = DEV.sessions[id];
+    if (!id || id === DEMO || !tok || !API) return;
     this.status = 'busy'; renderSync();
     try {
-      await Drive.connect(DEV.account || undefined);
-      const who = await Drive.whoAmI();
-      if (DEV.account !== who.email) {
-        const anon = DEV.account ? null : S.doc;
-        DEV.account = who.email; DEV.name = who.name; saveDev();
-        S.doc = LS.get(this.key()) || emptyDoc();
-        if (anon && anon.profiles.length) {
-          S.doc = mergeDocs(S.doc, anon);
-          LS.del('expediente:doc:local');
-          const m = this.smeta(); m.dirty = true; this.setSmeta(m);
-          this.saveLocal();
-        }
-      }
-      await this.pull(true);
-      ensureActive();
-      render();
-      return true;
-    } catch (e) {
-      this.status = 'off'; renderSync();
-      toast(e.message || 'No se pudo conectar con Google Drive.');
-      return false;
-    }
-  },
-  async pull(force) {
-    if (!DEV.account || !Drive.hasToken()) return;
-    const m = this.smeta();
-    let f = m.fileId ? await Drive.meta(m.fileId).catch(() => null) : null;
-    if (f && f.trashed) f = null;
-    if (!f) f = await Drive.findFile();
-    if (!f) {
-      const c = await Drive.create(S.doc);
-      Object.assign(m, { fileId: c.id, remoteModified: c.modifiedTime, dirty: false });
-      this.setSmeta(m); this.ok(); return;
-    }
-    m.fileId = f.id;
-    if (force || f.modifiedTime !== m.remoteModified) {
-      const remote = await Drive.download(f.id);
-      if (remote && Array.isArray(remote.profiles)) {
-        const merged = mergeDocs(S.doc, remote);
-        const needPush = !!m.dirty || signature(merged) !== signature(remote);
-        S.doc = merged; this.saveLocal(); ensureActive();
-        m.remoteModified = f.modifiedTime; m.dirty = needPush; this.setSmeta(m);
+      const r = await api({ action: 'cargar', token: tok });
+      if (!r.ok) { if (r.error === 'sesion') return this.expired(id); throw new Error(r.error); }
+      if (S.data.id !== id) return;
+      const dirty = this.isDirty(id);
+      if (r.data && (!dirty || (r.data.updatedAt || 0) > (S.data.updatedAt || 0))) {
+        S.data = normalize(r.data); LS.set(this.key(id), S.data); LS.del(this.dirtyKey(id));
         if (!S.sheet) render();
-        if (needPush) { await this.push(); return; }
-      } else {
-        m.remoteModified = null; m.dirty = true; this.setSmeta(m);
-        await this.push(); return;
       }
-    }
-    this.ok();
+      if (dirty || !r.data) await this.push(); else this.ok();
+    } catch (e) { this.status = 'pending'; renderSync(); }
+  },
+  save() {
+    const id = S.data.id;
+    S.data.updatedAt = Date.now();
+    LS.set(this.key(id), S.data);
+    if (id === DEMO) return;
+    LS.set(this.dirtyKey(id), true);
+    this.status = 'busy'; renderSync();
+    clearTimeout(this.timer); this.timer = setTimeout(() => this.push(), 1200);
   },
   async push() {
-    if (!DEV.account) return;
-    if (!Drive.hasToken()) { this.status = 'pending'; renderSync(); return; }
-    if (this.pushing) { this.again = true; return; }
-    this.pushing = true; this.status = 'busy'; renderSync();
+    const id = S.data && S.data.id, tok = DEV.sessions[id];
+    if (!id || id === DEMO || !tok || !API) return;
+    if (this.saving) { this.again = true; return; }
+    this.saving = true; this.status = 'busy'; renderSync();
     try {
-      const m = this.smeta();
-      if (!m.fileId) { this.pushing = false; await this.pull(true); return; }
-      const f = await Drive.meta(m.fileId);
-      if (f.trashed || f.modifiedTime !== m.remoteModified) { this.pushing = false; await this.pull(true); return; }
-      const r = await Drive.update(m.fileId, S.doc);
-      m.remoteModified = r.modifiedTime; m.dirty = false; this.setSmeta(m);
+      const r = await api({ action: 'guardar', token: tok, data: S.data });
+      if (!r.ok) { if (r.error === 'sesion') return this.expired(id); throw new Error(r.error); }
+      if (r.conflicto && r.data && S.data.id === id) {
+        S.data = normalize(r.data); LS.set(this.key(id), S.data);
+        if (!S.sheet) render();
+        toast('Se cargaron cambios más recientes hechos en otro dispositivo.');
+      }
+      LS.del(this.dirtyKey(id));
       this.ok();
     } catch (e) {
-      this.status = e.code === 'auth' ? 'pending' : 'error'; renderSync();
+      this.status = 'pending'; renderSync();
     } finally {
-      this.pushing = false;
+      this.saving = false;
       if (this.again) { this.again = false; this.push(); }
     }
   },
-  refresh() {
-    if (DEV.account && Drive.hasToken() && !this.pushing) this.pull(false).catch(() => { this.status = 'error'; renderSync(); });
-  }
+  ok() { this.status = 'ok'; this.last = Date.now(); renderSync(); },
+  expired(id) {
+    delete DEV.sessions[id]; saveDev();
+    this.status = 'pending'; renderSync();
+    toast('Tu sesión en este dispositivo terminó. Escribe tu PIN para seguir guardando.');
+    openPin(id);
+  },
+  refresh() { if (S.data && S.data.id !== DEMO && !this.saving && document.visibilityState === 'visible') this.pull(); }
 };
 
 /* =========================================================
    Estado
    ========================================================= */
 const S = {
-  doc: LS.get('expediente:doc:' + (DEV.account || 'local')) || emptyDoc(),
+  perfiles: LS.get('expediente:perfiles') || [],
+  data: null,
+  offline: false,
   tab: 'hoy',
   cal: { mode: 'semana', ref: today(), sel: today() },
   fMat: 'todas',
   tVista: 'pendientes',
   sheet: null
 };
-const activeKey = () => DEV.account || 'local';
-function ensureActive() {
-  const ps = S.doc.profiles;
-  if (!ps.length) return;
-  if (!ps.some((p) => p.id === DEV.active[activeKey()])) { DEV.active[activeKey()] = ps[0].id; saveDev(); }
-}
-const P = () => S.doc.profiles.find((p) => p.id === DEV.active[activeKey()]) || S.doc.profiles[0];
+const P = () => S.data;
+const hasSession = (id) => !!DEV.sessions[id];
 
 function normalize(p) {
   for (const k of ['materias', 'clases', 'tareas', 'faltas', 'temas']) if (!Array.isArray(p[k])) p[k] = [];
@@ -212,10 +184,8 @@ function normalize(p) {
   return p;
 }
 function mutate(fn, opts = {}) {
-  const p = P();
-  fn(p);
-  p.updatedAt = Date.now();
-  Sync.changed();
+  fn(S.data);
+  Store.save();
   render();
   if (S.sheet && opts.sheet !== false) refreshSheet();
 }
@@ -227,7 +197,7 @@ function semestreGuess() {
 function newProfile(o) {
   const now = Date.now();
   return normalize({
-    id: 'p' + uid(), createdAt: now, updatedAt: now,
+    id: o.id || 'p' + uid(), createdAt: now, updatedAt: 0,
     nombre: o.nombre || 'Mi perfil', carrera: o.carrera || '', semestre: o.semestre || '',
     inicio: o.inicio || '', fin: o.fin || '', color: o.color || TINCIONES[0].c,
     minAprob: 70, asistMin: 80
@@ -349,25 +319,22 @@ function taskRow(t) {
 const emptyNote = (txt) => `<p class="empty">${txt}</p>`;
 
 function syncPill() {
-  if (!Drive.configured() && !DEV.account) return '';
-  const map = {
-    local: ['off', 'Sin Drive'], ok: ['ok', 'Guardado'], busy: ['busy', 'Guardando…'],
-    pending: ['off', 'Sincronizar'], off: ['off', DEV.account ? 'Sincronizar' : 'Conectar Drive'], error: ['off', 'Reintentar']
-  };
-  let st = Sync.status;
-  if (!DEV.account) st = 'off';
-  const [cls, txt] = map[st] || map.off;
-  return `<button id="sync" class="sync ${cls}" data-act="sync" title="${DEV.account ? esc('Google Drive: ' + DEV.account) : 'Guardar en Google Drive'}"><i></i>${txt}</button>`;
+  if (!S.data) return '';
+  if (S.data.id === DEMO) return '<span class="sync"><i></i>Ejemplo</span>';
+  if (!hasSession(S.data.id)) return '<button id="sync" class="sync off" data-act="sync"><i></i>Entrar con PIN</button>';
+  const map = { ok: ['ok', 'Guardado'], busy: ['busy', 'Guardando…'], pending: ['off', 'Sin conexión'] };
+  const [cls, txt] = map[Store.status] || map.pending;
+  return `<button id="sync" class="sync ${cls}" data-act="sync" title="Se guarda en tu hoja de Google"><i></i>${txt}</button>`;
 }
 function renderSync() { const el = $('#sync'); if (el) el.outerHTML = syncPill(); }
+const inicial = (n) => esc((n || '?').trim().charAt(0).toUpperCase());
 
 /* =========================================================
    Vistas
    ========================================================= */
 function render() {
   const app = $('#app');
-  if (!S.doc.profiles.length) { app.innerHTML = viewWelcome(); return; }
-  ensureActive();
+  if (!S.data) { app.innerHTML = viewPicker(); return; }
   const p = normalize(P());
   const due = p.tareas.filter((x) => !x.hecha && x.fecha <= today()).length;
   const rep = p.temas.filter((x) => x.proximo <= today()).length;
@@ -380,7 +347,7 @@ function render() {
     <header class="top">
       <div class="brand">${LOGO}<div><b>Expediente Escolar</b><small>${esc([p.carrera, p.semestre].filter(Boolean).join(' · ') || 'Tu semestre en orden')}</small></div></div>
       ${syncPill()}
-      <button class="profile-chip" data-act="perfil" aria-label="Perfiles y ajustes"><span class="av" style="--c:${esc(p.color)}">${esc((p.nombre || '?').trim().charAt(0).toUpperCase())}</span><span>${esc(p.nombre)}</span></button>
+      <button class="profile-chip" data-act="perfil" aria-label="Perfiles y ajustes"><span class="av" style="--c:${esc(p.color)}">${inicial(p.nombre)}</span><span>${esc(p.nombre)}</span></button>
     </header>
     <nav class="nav" aria-label="Secciones">${tabs.map(([k, n, ic, b]) => `<button data-act="tab" data-id="${k}" ${S.tab === k ? 'aria-current="page"' : ''}><span class="badge">${ic}${b ? `<b>${b}</b>` : ''}</span><span>${n}</span></button>`).join('')}</nav>
     <main>${(views[S.tab] || viewHoy)(p)}</main>
@@ -388,25 +355,22 @@ function render() {
   if (S.tab === 'estudio') Timer.paint();
 }
 
-function viewWelcome() {
-  const g = semestreGuess();
-  const driveBox = Drive.configured()
-    ? `<div class="panel"><h3>¿Ya la usas en otro dispositivo?</h3><p class="muted small" style="margin:6px 0 12px">Conecta tu Google Drive y se cargan tus perfiles guardados.</p><button class="btn" data-act="sync">Conectar con Google Drive</button></div>`
-    : '';
+function viewPicker() {
+  const ps = S.perfiles;
+  const demo = Store.local(DEMO);
+  const aviso = !API
+    ? '<div class="notice warn">Falta conectar la hoja de Google (la dirección que termina en /exec) en el archivo config.js. Mientras tanto puedes explorar el perfil de ejemplo.</div>'
+    : S.offline && !ps.length ? '<div class="notice warn">No hay conexión con la hoja de Google. Revisa tu internet y vuelve a abrir la app.</div>' : '';
   return `<div class="shell"><div class="welcome">
     <div class="hero">
       <div class="stain-strip">${TINCIONES.slice(0, 6).map((t) => `<i style="--c:${t.c}"></i>`).join('')}</div>
       <span class="eyebrow">Expediente Escolar</span>
-      <h1>Tu semestre, en un solo lugar</h1>
-      <p>Horario, tareas por materia, calificaciones, faltas y repasos. Empieza creando tu perfil; puedes agregar más perfiles después.</p>
+      <h1>${ps.length ? '¿Quién va a usar la app?' : 'Tu semestre, en un solo lugar'}</h1>
+      <p>${ps.length ? 'Toca tu nombre y escribe tu PIN. Solo te lo pide la primera vez en cada dispositivo.' : 'Horario, tareas por materia, calificaciones, faltas y repasos. Crea tu perfil con un PIN para empezar.'}</p>
     </div>
-    <form class="panel form" id="f-nuevo" autocomplete="off">
-      <h2>Crear perfil</h2>
-      ${profileFields({ inicio: g.inicio, fin: g.fin, color: TINCIONES[0].c }, true)}
-      <button class="btn primary" type="submit">Crear perfil</button>
-    </form>
-    ${driveBox}
-    <div class="row"><button class="btn ghost" data-act="ejemplo">Explorar con un perfil de ejemplo</button></div>
+    ${aviso}
+    ${ps.length ? `<div class="plist">${ps.map((p) => `<button class="pbtn" data-act="pick" data-id="${esc(p.id)}"><span class="av" style="--c:${esc(p.color)}">${inicial(p.nombre)}</span><span class="pn">${esc(p.nombre)}</span><span class="muted small">${hasSession(p.id) ? 'Abrir' : 'Con PIN'}</span></button>`).join('')}</div>` : ''}
+    <div class="row">${API ? `<button class="btn primary" data-act="newPerfil">${I.plus} ${ps.length ? 'Nuevo perfil' : 'Crear mi perfil'}</button>` : ''}<button class="btn ghost" data-act="ejemplo">${demo ? 'Abrir' : 'Explorar'} el perfil de ejemplo</button></div>
   </div></div>`;
 }
 
@@ -666,6 +630,7 @@ function refreshSheet() {
   const { type, id } = S.sheet;
   if (type === 'mat') { if (mat(id)) openMat(id); else closeSheet(); }
   else if (type === 'perfil') openPerfil();
+  else if (type === 'task' || type === 'pin' || type === 'newperfil' || type === 'newmat') return;
 }
 const sheetTop = (title, extra = '') => `<div class="sheet-top"><h2 id="sheet-title">${title}</h2><div class="row">${extra}<button class="btn sm ghost" data-act="close" aria-label="Cerrar">${I.x}</button></div></div>`;
 
@@ -749,49 +714,68 @@ function openMat(id) {
 
 function openPerfil() {
   const p = P();
-  const others = S.doc.profiles;
-  let drive;
-  if (!Drive.configured()) {
-    drive = `<div class="notice warn">Falta configurar la conexión con Google (el "ID de cliente"). Sigue las instrucciones del archivo LEEME del proyecto. Mientras tanto, todo se guarda en este navegador.</div>
-      <form id="f-client" class="row" style="margin-top:10px" autocomplete="off"><input id="cl-id" class="btn" style="flex:1 1 220px;font-weight:400;text-align:left;cursor:text" placeholder="ID de cliente de Google" required><button class="btn" type="submit">Guardar</button></form>`;
-  } else if (DEV.account) {
-    const when = Sync.last ? new Date(Sync.last).toLocaleTimeString('es-MX', { hour: '2-digit', minute: '2-digit' }) : null;
-    drive = `<p class="small" style="margin:0 0 10px">Conectado como <b>${esc(DEV.account)}</b>. Tus perfiles se guardan en el archivo «${esc(Drive.FILE_NAME)}» de tu Drive${when ? `; último guardado a las ${when}` : ''}.</p>
-      <div class="row"><button class="btn" data-act="sync">Sincronizar ahora</button><button class="btn danger" data-act="logout" data-confirm="1">Cerrar sesión en este dispositivo</button></div>
-      <p class="muted small">Cerrar sesión borra la copia de este dispositivo; tus datos siguen en Drive.</p>`;
-  } else {
-    drive = `<p class="small" style="margin:0 0 10px">Guarda tus perfiles en tu Google Drive para no perderlos y verlos igual en tu celular y tu computadora. La app solo puede ver el archivo que ella misma crea, no el resto de tu Drive.</p><button class="btn primary" data-act="sync">Conectar con Google Drive</button>`;
-  }
+  const isDemo = p.id === DEMO;
+  const lista = [...S.perfiles];
+  if (Store.local(DEMO) && !lista.some((x) => x.id === DEMO)) lista.push({ id: DEMO, nombre: 'Perfil de ejemplo', color: TINCIONES[5].c });
+  const when = Store.last ? new Date(Store.last).toLocaleTimeString('es-MX', { hour: '2-digit', minute: '2-digit' }) : null;
+  const guardado = isDemo
+    ? '<p class="small muted" style="margin:0">El perfil de ejemplo solo vive en este dispositivo y no se guarda en la hoja.</p>'
+    : `<p class="small" style="margin:0">Tus datos se guardan en la hoja de Google de la app${when ? `; último guardado a las ${when}` : ''}. En este dispositivo también queda una copia, así que funciona sin internet y sube los cambios cuando vuelve la conexión.</p>`;
   const nSup = 'Notification' in window;
   const nState = !nSup ? 'unsupported' : Notification.permission;
   const avisos = !nSup
-    ? `<p class="small muted">Este navegador no permite avisos. En iPhone, primero agrega la app a tu pantalla de inicio (Compartir → Agregar a inicio) y ábrela desde ahí.</p>`
+    ? '<p class="small muted">Este navegador no permite avisos. En iPhone, primero agrega la app a tu pantalla de inicio (Compartir → Agregar a inicio) y ábrela desde ahí.</p>'
     : `<label class="check-line"><input type="checkbox" id="n-on" ${DEV.notif.on && nState === 'granted' ? 'checked' : ''}><span>Avisarme de clases, entregas, exámenes y repasos</span></label>
        <label class="f" style="margin-top:10px;max-width:260px">Aviso antes de cada clase<select id="n-min">${[5, 10, 15, 30].map((v) => `<option value="${v}" ${DEV.notif.claseMin === v ? 'selected' : ''}>${v} minutos antes</option>`).join('')}</select></label>
        ${nState === 'denied' ? '<p class="small" style="color:var(--eosin)">Los avisos están bloqueados para esta página. Actívalos en la configuración del navegador.</p>' : ''}
        <p class="muted small">Estos avisos llegan mientras la app está abierta o en segundo plano. Para recibirlos aunque la cierres, usa los botones de Google Calendar en tus tareas y clases.</p>`;
+  const pinBox = (field, label) => `<label class="f">${label}<input id="${field}" type="password" inputmode="numeric" pattern="[0-9]*" minlength="4" maxlength="6" required autocomplete="off"></label>`;
   openSheet(`${sheetTop('Perfiles y ajustes')}
     <h3>Perfiles</h3>
-    <div class="mini-list">${others.map((o) => `<div><span class="row" style="flex-wrap:nowrap;min-width:0"><span class="av" style="--c:${esc(o.color)}">${esc((o.nombre || '?').charAt(0).toUpperCase())}</span><span style="min-width:0"><b>${esc(o.nombre)}</b><br><span class="muted small">${esc([o.carrera, o.semestre].filter(Boolean).join(' · '))}</span></span></span>${o.id === p.id ? '<span class="pill hema">En uso</span>' : `<button class="btn sm" data-act="switchP" data-id="${o.id}">Usar</button>`}</div>`).join('')}</div>
-    <div class="row" style="margin-top:10px"><button class="btn" data-act="newPerfil">${I.plus} Nuevo perfil</button></div>
+    <div class="mini-list">${lista.map((o) => `<div><span class="row" style="flex-wrap:nowrap;min-width:0"><span class="av" style="--c:${esc(o.color)}">${inicial(o.nombre)}</span><b style="min-width:0;overflow-wrap:anywhere">${esc(o.nombre)}</b></span>${o.id === p.id ? '<span class="pill hema">En uso</span>' : `<button class="btn sm" data-act="pick" data-id="${esc(o.id)}">${hasSession(o.id) ? 'Cambiar' : 'Entrar con PIN'}</button>`}</div>`).join('')}</div>
+    <div class="row" style="margin-top:10px">${API ? `<button class="btn" data-act="newPerfil">${I.plus} Nuevo perfil</button>` : ''}<button class="btn ghost" data-act="lista">Ver pantalla de perfiles</button></div>
     <hr class="section-sep">
     <h3>Editar «${esc(p.nombre)}»</h3>
     <form id="f-perfil" class="form" autocomplete="off">${profileFields(p, false)}<div class="row" style="justify-content:flex-end"><button class="btn primary" type="submit">Guardar perfil</button></div></form>
     <hr class="section-sep">
-    <h3>Google Drive</h3>${drive}
+    <h3>Dónde se guarda</h3>${guardado}
+    ${isDemo ? '' : `<hr class="section-sep">
+    <h3>Cambiar PIN</h3>
+    <form id="f-pinchg" class="form" autocomplete="off"><div class="two">${pinBox('pc-act', 'PIN actual')}${pinBox('pc-new', 'PIN nuevo')}</div><div class="row" style="justify-content:flex-end"><button class="btn" type="submit">Cambiar PIN</button></div></form>
+    <p class="muted small">Al cambiarlo se cierra la sesión de este perfil en los demás dispositivos.</p>`}
     <hr class="section-sep">
     <h3>Avisos en este dispositivo</h3>${avisos}
     <hr class="section-sep">
     <h3>Copia de seguridad</h3>
-    <p class="muted small" style="margin:0 0 10px">Descarga un archivo con todos tus perfiles o recupera uno que guardaste antes.</p>
+    <p class="muted small" style="margin:0 0 10px">Descarga un archivo con los datos de este perfil, o recupera uno que guardaste antes (reemplaza lo que hay ahora).</p>
     <div class="row"><button class="btn" data-act="export">Descargar copia</button><label class="btn" for="imp-file">Recuperar copia<input id="imp-file" type="file" accept="application/json,.json" hidden></label></div>
     <hr class="section-sep">
-    <button class="btn danger" data-act="delPerfil" data-confirm="1">Eliminar el perfil «${esc(p.nombre)}»</button>`, { type: 'perfil' });
+    ${isDemo ? '<button class="btn danger" data-act="delDemo" data-confirm="1">Borrar el perfil de ejemplo</button>' : `<div class="row"><button class="btn danger" data-act="logout" data-confirm="1">Cerrar sesión de «${esc(p.nombre)}» en este dispositivo</button></div>
+    <p class="muted small">Para volver a entrar te pedirá tu PIN. Tus datos siguen guardados en la hoja.</p>
+    <details style="margin-top:12px"><summary class="small" style="cursor:pointer;font-weight:700;color:var(--eosin)">Eliminar este perfil para siempre</summary>
+      <form id="f-borrar" class="form" style="margin-top:10px" autocomplete="off"><p class="small" style="margin:0">Se borran todas sus materias, tareas y calificaciones. No se puede deshacer.</p>${pinBox('pb-pin', 'Escribe tu PIN para confirmar')}<div class="row"><button class="btn danger" type="submit">Eliminar perfil</button></div></form>
+    </details>`}`, { type: 'perfil' });
 }
 function openNewPerfil() {
   const g = semestreGuess();
-  openSheet(`${sheetTop('Nuevo perfil')}<p class="muted small" style="margin-top:0">Útil para llevar otro ciclo, una segunda carrera o para que otra persona use la app en este mismo dispositivo.</p>
-    <form id="f-nuevo" class="form" autocomplete="off">${profileFields({ inicio: g.inicio, fin: g.fin, color: TINCIONES[S.doc.profiles.length % TINCIONES.length].c }, true)}<div class="row" style="justify-content:flex-end"><button class="btn primary" type="submit">Crear y usar</button></div></form>`, { type: 'newperfil' });
+  const anyToken = Object.entries(DEV.sessions).find(([k]) => k !== DEMO);
+  openSheet(`${sheetTop('Nuevo perfil')}<p class="muted small" style="margin-top:0">Cada persona tiene su propio perfil con PIN. También sirve para llevar otro ciclo o una segunda carrera.</p>
+    <form id="f-nuevo" class="form" autocomplete="off">${profileFields({ inicio: g.inicio, fin: g.fin, color: TINCIONES[S.perfiles.length % TINCIONES.length].c }, true)}
+      <div class="two"><label class="f">PIN (4 a 6 números)<input id="pf-pin" type="password" inputmode="numeric" pattern="[0-9]*" minlength="4" maxlength="6" required autocomplete="off"></label><label class="f">Repite el PIN<input id="pf-pin2" type="password" inputmode="numeric" pattern="[0-9]*" minlength="4" maxlength="6" required autocomplete="off"></label></div>
+      ${anyToken ? '' : '<label class="f">Código de instalación<input id="pf-codigo" inputmode="numeric" required maxlength="10" autocomplete="off" placeholder="Te lo da quien instaló la app"></label><p class="muted small" style="margin:-4px 0 0">Solo se pide en un dispositivo donde todavía nadie ha entrado.</p>'}
+      <p class="small" id="pf-err" role="alert" style="color:var(--eosin);margin:0"></p>
+      <div class="row" style="justify-content:flex-end"><button class="btn primary" type="submit" id="pf-btn">Crear perfil</button></div></form>`, { type: 'newperfil' });
+}
+function openPin(id) {
+  const m = S.perfiles.find((p) => p.id === id) || { nombre: 'Perfil', color: TINCIONES[0].c };
+  openSheet(`${sheetTop(`<span class="row" style="flex-wrap:nowrap"><span class="av" style="--c:${esc(m.color)}">${inicial(m.nombre)}</span>${esc(m.nombre)}</span>`)}
+    <form id="f-pin" class="form" data-id="${esc(id)}" autocomplete="off">
+      <label class="f">Escribe tu PIN<input id="pin-in" type="password" inputmode="numeric" pattern="[0-9]*" minlength="4" maxlength="6" required autocomplete="off" style="font-size:1.4rem;letter-spacing:.4em;text-align:center"></label>
+      <p class="small" id="pin-err" role="alert" style="color:var(--eosin);margin:0"></p>
+      <button class="btn primary" type="submit" id="pin-btn">Entrar</button>
+      <p class="muted small" style="margin:0">Solo te lo pide la primera vez en este dispositivo. Si lo olvidaste, alguien con acceso a la hoja de Google puede ayudarte a recuperar tus datos.</p>
+    </form>`, { type: 'pin', id });
+  setTimeout(() => { const i = $('#pin-in'); if (i) i.focus(); }, 60);
 }
 
 /* =========================================================
@@ -878,7 +862,7 @@ const Notif = {
   },
   mark(k) { DEV.notified[k] = Date.now(); },
   check() {
-    if (!DEV.notif.on || !S.doc.profiles.length) return;
+    if (!DEV.notif.on || !S.data) return;
     const p = P(), t = today(), nm = nowMin(), now = Date.now();
     for (const [k, v] of Object.entries(DEV.notified)) if (now - v > 4 * 86400000) delete DEV.notified[k];
     let changed = false;
@@ -917,7 +901,7 @@ const Notif = {
    ========================================================= */
 function makeEjemplo() {
   const t = today();
-  const p = newProfile({ nombre: 'Perfil de ejemplo', carrera: 'Médico Cirujano', semestre: '3er semestre', ...semestreGuess(), color: TINCIONES[5].c });
+  const p = newProfile({ id: DEMO, nombre: 'Perfil de ejemplo', carrera: 'Médico Cirujano', semestre: '3er semestre', ...semestreGuess(), color: TINCIONES[5].c });
   const M = (nombre, color, profe, salon) => ({ id: 'm' + uid(), nombre, color, profe, salon, criterios: [] });
   const ana = M('Anatomía Humana', TINCIONES[0].c, 'Dra. Ramírez', 'Anfiteatro 2');
   const fis = M('Fisiología', TINCIONES[1].c, 'Dr. Ortega', 'Aula 14');
@@ -966,14 +950,6 @@ function toast(msg) {
   const el = $('#toast'); el.textContent = msg; el.hidden = false;
   clearTimeout(toastT); toastT = setTimeout(() => { el.hidden = true; }, 3200);
 }
-function useProfile(p) {
-  S.doc.profiles.push(p);
-  DEV.active[activeKey()] = p.id; saveDev();
-  p.updatedAt = Date.now();
-  Sync.changed();
-  S.tab = 'hoy';
-}
-
 document.addEventListener('click', async (e) => {
   const el = e.target.closest('[data-act]');
   if (!el) return;
@@ -989,15 +965,19 @@ document.addEventListener('click', async (e) => {
     case 'close': closeSheet(); break;
     case 'perfil': openPerfil(); break;
     case 'newPerfil': openNewPerfil(); break;
-    case 'switchP': DEV.active[activeKey()] = id; saveDev(); S.fMat = 'todas'; closeSheet(); render(); toast('Perfil cambiado.'); break;
-    case 'delPerfil': {
-      const p = P();
-      S.doc.profiles = S.doc.profiles.filter((x) => x.id !== p.id);
-      S.doc.deleted = [...(S.doc.deleted || []), p.id];
-      ensureActive(); Sync.changed(); closeSheet(); render(); toast('Perfil eliminado.');
+    case 'pick':
+      closeSheet();
+      if (hasSession(id) || id === DEMO) { S.tab = 'hoy'; Store.activate(id); }
+      else openPin(id);
       break;
-    }
-    case 'ejemplo': useProfile(makeEjemplo()); render(); toast('Este es un perfil de ejemplo. Puedes borrarlo en Perfiles y ajustes.'); break;
+    case 'lista': closeSheet(); DEV.active = null; saveDev(); S.data = null; render(); Store.refreshList().then(() => { if (!S.data) render(); }); break;
+    case 'ejemplo':
+      if (!Store.local(DEMO)) LS.set(Store.key(DEMO), makeEjemplo());
+      DEV.sessions[DEMO] = 'local'; saveDev(); S.tab = 'hoy';
+      Store.activate(DEMO);
+      toast('Este es un perfil de ejemplo. Puedes borrarlo en Perfiles y ajustes.');
+      break;
+    case 'delDemo': LS.del(Store.key(DEMO)); delete DEV.sessions[DEMO]; DEV.active = null; saveDev(); S.data = null; closeSheet(); render(); toast('Perfil de ejemplo borrado.'); break;
     case 'newTask': openTask(null, el.dataset.date); break;
     case 'editTask': openTask(id); break;
     case 'toggle': mutate((p) => { const t = p.tareas.find((x) => x.id === id); if (t) { t.hecha = !t.hecha; if (t.hecha) toast('¡Hecha!'); } }); break;
@@ -1037,23 +1017,24 @@ document.addEventListener('click', async (e) => {
     }); break;
     case 'delTema': mutate((p) => { p.temas = p.temas.filter((x) => x.id !== id); }); break;
     case 'sync':
-      if (!Drive.configured()) { openPerfil(); break; }
-      if (DEV.account && Drive.hasToken()) { Sync.status = 'busy'; renderSync(); try { await Sync.pull(true); } catch (err) { Sync.status = 'error'; renderSync(); toast('No se pudo sincronizar. Revisa tu conexión.'); } }
-      else { const ok = await Sync.connect(); if (ok) toast('Conectado con Google Drive.'); }
-      if (S.sheet && S.sheet.type === 'perfil') openPerfil();
+      if (!S.data || S.data.id === DEMO) break;
+      if (!hasSession(S.data.id)) { openPin(S.data.id); break; }
+      await Store.pull();
+      if (Store.status === 'ok') toast('Todo guardado en la hoja.'); else toast('Sin conexión. Tus cambios están en este dispositivo y se subirán después.');
       break;
     case 'logout': {
-      Drive.disconnect();
-      LS.del('expediente:doc:' + DEV.account); LS.del('expediente:sync:' + DEV.account);
-      delete DEV.active[DEV.account];
-      DEV.account = null; DEV.name = null; saveDev();
-      S.doc = LS.get('expediente:doc:local') || emptyDoc(); Sync.status = 'local';
+      const pid = S.data.id, tok = DEV.sessions[pid];
+      if (Store.isDirty(pid)) await Store.push();
+      if (Store.isDirty(pid)) { toast('Hay cambios sin subir. Conéctate a internet antes de cerrar sesión.'); break; }
+      if (tok) api({ action: 'salir', token: tok }, 8000).catch(() => {});
+      delete DEV.sessions[pid]; LS.del(Store.key(pid)); LS.del(Store.dirtyKey(pid));
+      DEV.active = null; saveDev(); S.data = null;
       closeSheet(); render(); toast('Sesión cerrada en este dispositivo.');
       break;
     }
     case 'export': {
-      const blob = new Blob([JSON.stringify(S.doc, null, 1)], { type: 'application/json' });
-      const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `expediente-respaldo-${today()}.json`;
+      const blob = new Blob([JSON.stringify(S.data, null, 1)], { type: 'application/json' });
+      const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `expediente-${(S.data.nombre || 'perfil').toLowerCase().replace(/[^a-z0-9]+/gi, '-')}-${today()}.json`;
       document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 2000);
       break;
     }
@@ -1084,25 +1065,81 @@ document.addEventListener('change', async (e) => {
     DEV.notif.claseMin = Number(el.value); saveDev();
   } else if (el.id === 'imp-file' && el.files[0]) {
     try {
-      const data = JSON.parse(await el.files[0].text());
-      if (!data || !Array.isArray(data.profiles)) throw new Error('formato');
-      data.profiles.forEach(normalize);
-      S.doc = mergeDocs(S.doc, data);
-      ensureActive(); Sync.changed(); closeSheet(); render();
-      toast(`Copia recuperada: ${data.profiles.length} ${data.profiles.length === 1 ? 'perfil' : 'perfiles'}.`);
+      let data = JSON.parse(await el.files[0].text());
+      if (data && Array.isArray(data.profiles)) data = data.profiles[0];
+      if (!data || !Array.isArray(data.materias)) throw new Error('formato');
+      const id = S.data.id;
+      S.data = normalize({ ...data, id });
+      Store.save(); closeSheet(); render();
+      toast('Copia recuperada.');
     } catch (err) { toast('Ese archivo no es una copia de Expediente Escolar.'); }
   }
 });
 
-document.addEventListener('submit', (e) => {
+document.addEventListener('submit', async (e) => {
   const f = e.target;
   e.preventDefault();
   const v = (sel) => { const el = f.querySelector(sel); return el ? el.value.trim() : ''; };
   const radio = (name) => { const el = f.querySelector(`input[name=${name}]:checked`); return el ? el.value : TINCIONES[0].c; };
   switch (f.id) {
     case 'f-nuevo': {
-      const p = newProfile({ nombre: v('#pf-nombre'), carrera: v('#pf-carrera'), semestre: v('#pf-semestre'), inicio: v('#pf-inicio'), fin: v('#pf-fin'), color: radio('pcolor') });
-      useProfile(p); closeSheet(); render(); toast(`Perfil «${p.nombre}» creado.`);
+      const err = $('#pf-err'), btn = $('#pf-btn');
+      const pin = v('#pf-pin');
+      if (!/^\d{4,6}$/.test(pin)) { err.textContent = 'El PIN debe tener de 4 a 6 números.'; return; }
+      if (pin !== v('#pf-pin2')) { err.textContent = 'Los dos PIN no coinciden.'; return; }
+      const anyToken = (Object.entries(DEV.sessions).find(([k]) => k !== DEMO) || [])[1];
+      const datos = { nombre: v('#pf-nombre'), carrera: v('#pf-carrera'), semestre: v('#pf-semestre'), inicio: v('#pf-inicio'), fin: v('#pf-fin'), color: radio('pcolor') };
+      btn.disabled = true; btn.textContent = 'Creando…'; err.textContent = '';
+      try {
+        const r = await api({ action: 'crearPerfil', token: anyToken, codigo: v('#pf-codigo'), nombre: datos.nombre, carrera: datos.carrera, color: datos.color, pin, dispositivo: dispositivo() });
+        if (!r.ok) {
+          const E = { codigo: 'El código de instalación no es correcto.', pinFormato: 'El PIN debe tener de 4 a 6 números.', nombre: 'Escribe un nombre.', limite: 'Ya hay demasiados perfiles.' };
+          err.textContent = E[r.error] || 'No se pudo crear el perfil. Intenta de nuevo.'; btn.disabled = false; btn.textContent = 'Crear perfil'; return;
+        }
+        DEV.sessions[r.id] = r.token; saveDev();
+        S.perfiles = [...S.perfiles, { id: r.id, nombre: datos.nombre, color: datos.color }]; LS.set('expediente:perfiles', S.perfiles);
+        LS.set(Store.key(r.id), newProfile({ id: r.id, ...datos }));
+        closeSheet(); S.tab = 'hoy';
+        await Store.activate(r.id);
+        Store.save();
+        toast(`Perfil «${datos.nombre}» creado.`);
+      } catch (x) { err.textContent = 'No hay conexión con la hoja de Google. Revisa tu internet.'; btn.disabled = false; btn.textContent = 'Crear perfil'; }
+      break;
+    }
+    case 'f-pin': {
+      const id = f.dataset.id, err = $('#pin-err'), btn = $('#pin-btn');
+      btn.disabled = true; btn.textContent = 'Entrando…'; err.textContent = '';
+      try {
+        const r = await api({ action: 'entrar', id, pin: v('#pin-in'), dispositivo: dispositivo() });
+        if (!r.ok) {
+          const E = { pin: `PIN incorrecto. Te quedan ${r.quedan} intentos.`, bloqueado: `Demasiados intentos. Espera ${r.minutos} minutos.`, perfil: 'Ese perfil ya no existe.' };
+          err.textContent = E[r.error] || 'No se pudo entrar. Intenta de nuevo.'; btn.disabled = false; btn.textContent = 'Entrar';
+          $('#pin-in').value = ''; return;
+        }
+        DEV.sessions[id] = r.token; saveDev();
+        closeSheet(); S.tab = 'hoy';
+        await Store.activate(id);
+      } catch (x) { err.textContent = 'No hay conexión con la hoja de Google. Revisa tu internet.'; btn.disabled = false; btn.textContent = 'Entrar'; }
+      break;
+    }
+    case 'f-pinchg': {
+      try {
+        const r = await api({ action: 'cambiarPin', token: DEV.sessions[S.data.id], actual: v('#pc-act'), nuevo: v('#pc-new') });
+        toast(r.ok ? 'Listo, tu PIN cambió.' : r.error === 'pin' ? 'Tu PIN actual no es correcto.' : r.error === 'pinFormato' ? 'El PIN nuevo debe tener de 4 a 6 números.' : 'No se pudo cambiar el PIN.');
+        if (r.ok) f.reset();
+      } catch (x) { toast('Necesitas internet para cambiar el PIN.'); }
+      break;
+    }
+    case 'f-borrar': {
+      try {
+        const pid = S.data.id;
+        const r = await api({ action: 'borrarPerfil', token: DEV.sessions[pid], pin: v('#pb-pin') });
+        if (!r.ok) { toast(r.error === 'pin' ? 'PIN incorrecto.' : 'No se pudo eliminar el perfil.'); return; }
+        delete DEV.sessions[pid]; LS.del(Store.key(pid)); LS.del(Store.dirtyKey(pid));
+        S.perfiles = S.perfiles.filter((x) => x.id !== pid); LS.set('expediente:perfiles', S.perfiles);
+        DEV.active = null; saveDev(); S.data = null; closeSheet(); render();
+        toast('Perfil eliminado.');
+      } catch (x) { toast('Necesitas internet para eliminar el perfil.'); }
       break;
     }
     case 'f-perfil': {
@@ -1161,23 +1198,26 @@ document.addEventListener('submit', (e) => {
       toast('Tema agregado. Primer repaso: mañana.');
       break;
     }
-    case 'f-client': {
-      try { localStorage.setItem('expediente:clientId', v('#cl-id')); } catch (err) { /* nada */ }
-      openPerfil(); toast('ID guardado. Ya puedes conectar Google Drive.');
-      break;
-    }
   }
 });
 
 /* =========================================================
    Arranque
    ========================================================= */
-S.doc.profiles.forEach(normalize);
-ensureActive();
-if (DEV.account) Sync.status = 'pending';
-render();
-setInterval(() => { Notif.check(); if (S.tab === 'hoy' && !S.sheet && document.visibilityState === 'visible') render(); }, 60000);
+(async () => {
+  if (DEV.active && hasSession(DEV.active) && (Store.local(DEV.active) || DEV.active !== DEMO)) {
+    await Store.activate(DEV.active);
+    Store.refreshList();
+  } else {
+    DEV.active = null;
+    render();
+    await Store.refreshList();
+    if (!S.data) render();
+  }
+})();
+setInterval(() => { Notif.check(); if (S.data && S.tab === 'hoy' && !S.sheet && document.visibilityState === 'visible') render(); }, 60000);
 setTimeout(() => Notif.check(), 3000);
-setInterval(() => Sync.refresh(), 120000);
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') { Sync.refresh(); Notif.check(); Timer.tick(); } });
+setInterval(() => Store.refresh(), 120000);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') { Store.refresh(); Notif.check(); Timer.tick(); } });
+window.addEventListener('online', () => Store.refresh());
 if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
